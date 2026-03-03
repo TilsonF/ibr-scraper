@@ -1,8 +1,108 @@
-const axios   = require('axios');
+const axios = require('axios');
 const cheerio = require('cheerio');
+const fs = require('fs');
+const path = require('path');
+
+const CACHE_FILE = path.join(__dirname, 'ibr_cache.json');
+const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hora en milisegundos
+
+// Check if we want purely JSON output (e.g. for API usage)
+const isJsonOutput = process.argv.includes('--json');
+
+function log(message) {
+  if (!isJsonOutput) {
+    console.log(message);
+  }
+}
+
+function warn(message, error) {
+  if (!isJsonOutput) {
+    console.warn(message, error);
+  }
+}
+
+function isBusinessDayAndTime() {
+  const now = new Date();
+
+  // Ajustar a zona horaria de Colombia (UTC-5)
+  // UtilizamostoLocaleString para obtener la fecha y hora en la zona de Bogotá
+  const options = { timeZone: 'America/Bogota', hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' };
+  const strBogota = now.toLocaleString('en-US', options);
+
+  // Extraer mes, día, año, hora y minuto
+  const matches = strBogota.match(/(\d+)\/(\d+)\/(\d+),?\s+(\d+):(\d+)/);
+  if (!matches) return true; // Fallback por seguridad
+
+  const [_, month, day, year, hrStr, minStr] = matches;
+  const hour = parseInt(hrStr, 10);
+  const min = parseInt(minStr, 10);
+
+  // Crear una fecha local basada en la hora de Bogotá para obtener el día de la semana
+  const dateBogota = new Date(year, month - 1, day);
+  const dayOfWeek = dateBogota.getDay();
+
+  // Verificar si es fin de semana (0 = Domingo, 6 = Sábado)
+  if (dayOfWeek === 0 || dayOfWeek === 6) {
+    return false;
+  }
+
+  // Verificar si es después de las 11:45 AM
+  if (hour < 11 || (hour === 11 && min < 45)) {
+    return false;
+  }
+
+  return true;
+}
+
+function getCache() {
+  if (fs.existsSync(CACHE_FILE)) {
+    try {
+      const stat = fs.statSync(CACHE_FILE);
+      const now = Date.now();
+      if (now - stat.mtimeMs < CACHE_TTL_MS) {
+        const raw = fs.readFileSync(CACHE_FILE, 'utf8');
+        return JSON.parse(raw);
+      }
+    } catch (e) {
+      warn('⚠️ Error al leer el caché:', e.message);
+    }
+  }
+  return null;
+}
+
+function saveCache(data) {
+  try {
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    warn('⚠️ Error al guardar el caché:', e.message);
+  }
+}
 
 async function obtenerIBR() {
-  console.log('⏳ Consultando IBR desde BanRep...\n');
+  if (!isBusinessDayAndTime()) {
+    log('⏳ No es un día hábil después de las 11:45 a.m. (Hora de Colombia). Se usará el caché si existe o se detendrá.');
+    const cachedData = getCache();
+    if (cachedData) {
+      log('📦 Retornando datos del caché (sin actualizar por horario):');
+      if (isJsonOutput) console.log(JSON.stringify(cachedData));
+      else console.log(JSON.stringify(cachedData, null, 2));
+      return cachedData;
+    } else {
+      log('🛑 No hay datos en caché y no es un horario válido para consultar al banco.');
+      if (isJsonOutput) console.log(JSON.stringify({ error: "No cache available and currently outside allowed business hours." }));
+      return null;
+    }
+  }
+
+  const cachedData = getCache();
+  if (cachedData) {
+    log('⚡ Retornando IBR desde el caché (válido por 1 hr).');
+    if (isJsonOutput) console.log(JSON.stringify(cachedData));
+    else console.log(JSON.stringify(cachedData, null, 2));
+    return cachedData;
+  }
+
+  log('⏳ Consultando IBR desde BanRep...\n');
 
   const { data } = await axios.get(
     'https://totoro.banrep.gov.co/estadisticas-economicas/',
@@ -43,34 +143,45 @@ async function obtenerIBR() {
 
   if (!ibr) throw new Error('No se pudo extraer el IBR');
 
-  const fecha        = new Date().toLocaleDateString('es-CO');
-  const ibrEA        = (Math.pow(1 + (ibr / 100) / 365, 365) - 1) * 100;
-  const ibrMensual   = (Math.pow(1 + (ibr / 100) / 365, 30)  - 1) * 100;
-  const usuraEA      = ibrEA * 1.5;
+  const fecha = new Date().toLocaleDateString('es-CO');
+  const ibrEA = (Math.pow(1 + (ibr / 100) / 365, 365) - 1) * 100;
+  const ibrMensual = (Math.pow(1 + (ibr / 100) / 365, 30) - 1) * 100;
+  const usuraEA = ibrEA * 1.5;
   const usuraMensual = ibrMensual * 1.5;
 
   const resultado = {
     fecha,
-    ibrNominal:   +ibr.toFixed(4),
-    ibrEA:        +ibrEA.toFixed(4),
-    ibrMensual:   +ibrMensual.toFixed(4),
-    usuraMaxEA:   +usuraEA.toFixed(4),
+    ibrNominal: +ibr.toFixed(4),
+    ibrEA: +ibrEA.toFixed(4),
+    ibrMensual: +ibrMensual.toFixed(4),
+    usuraMaxEA: +usuraEA.toFixed(4),
     usuraMaxMens: +usuraMensual.toFixed(4),
   };
 
-  console.log('─── IBR Overnight ───────────────────────');
-  console.log(`📅 Fecha:               ${fecha}`);
-  console.log(`📊 IBR Nominal:         ${ibr}%`);
-  console.log(`📈 IBR EA:              ${ibrEA.toFixed(4)}%`);
-  console.log(`📆 IBR Mensual:         ${ibrMensual.toFixed(4)}%`);
-  console.log('─── Tasa de Usura ───────────────────────');
-  console.log(`🚨 Usura Máx EA:       ${usuraEA.toFixed(4)}%`);
-  console.log(`🚨 Usura Máx Mensual:  ${usuraMensual.toFixed(4)}%`);
-  console.log('─────────────────────────────────────────');
-  console.log('\n📦 JSON:');
-  console.log(JSON.stringify(resultado, null, 2));
+  log('─── IBR Overnight ───────────────────────');
+  log(`📅 Fecha:               ${fecha}`);
+  log(`📊 IBR Nominal:         ${ibr}%`);
+  log(`📈 IBR EA:              ${ibrEA.toFixed(4)}%`);
+  log(`📆 IBR Mensual:         ${ibrMensual.toFixed(4)}%`);
+  log('─── Tasa de Usura ───────────────────────');
+  log(`🚨 Usura Máx EA:       ${usuraEA.toFixed(4)}%`);
+  log(`🚨 Usura Máx Mensual:  ${usuraMensual.toFixed(4)}%`);
+  log('─────────────────────────────────────────');
+
+  saveCache(resultado);
+  log('\n📦 Se guardó el resultado en caché.');
+
+  if (isJsonOutput) {
+    console.log(JSON.stringify(resultado));
+  }
 
   return resultado;
 }
 
-obtenerIBR().catch(e => console.error('❌', e.message));
+obtenerIBR().catch(e => {
+  if (isJsonOutput) {
+    console.log(JSON.stringify({ error: e.message }));
+  } else {
+    console.error('❌', e.message);
+  }
+});

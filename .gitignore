@@ -4,3 +4,4 @@ package-lock.json
 .env
 .DS_Store
 ibr_debug.js
+ibr_cache.json
