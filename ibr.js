@@ -3,11 +3,13 @@ const cheerio = require('cheerio');
 const fs = require('fs');
 const path = require('path');
 
-const CACHE_FILE = path.join(__dirname, 'ibr_cache.json');
+// En AWS Lambda solo se tiene permisos de escritura en /tmp
+const isLambda = !!process.env.AWS_REGION || !!process.env.AWS_EXECUTION_ENV;
+const CACHE_FILE = isLambda ? '/tmp/ibr_cache.json' : path.join(__dirname, 'ibr_cache.json');
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hora en milisegundos
 
-// Check if we want purely JSON output (e.g. for API usage)
-const isJsonOutput = process.argv.includes('--json');
+// Check if we want purely JSON output (e.g. for API usage o si es Lambda)
+const isJsonOutput = process.argv.includes('--json') || isLambda;
 
 function log(message) {
   if (!isJsonOutput) {
@@ -25,7 +27,6 @@ function isBusinessDayAndTime() {
   const now = new Date();
 
   // Ajustar a zona horaria de Colombia (UTC-5)
-  // UtilizamostoLocaleString para obtener la fecha y hora en la zona de Bogotá
   const options = { timeZone: 'America/Bogota', hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' };
   const strBogota = now.toLocaleString('en-US', options);
 
@@ -84,36 +85,37 @@ async function obtenerIBR() {
     const cachedData = getCache();
     if (cachedData) {
       log('📦 Retornando datos del caché (sin actualizar por horario):');
-      if (isJsonOutput) console.log(JSON.stringify(cachedData));
-      else console.log(JSON.stringify(cachedData, null, 2));
       return cachedData;
     } else {
       log('🛑 No hay datos en caché y no es un horario válido para consultar al banco.');
-      if (isJsonOutput) console.log(JSON.stringify({ error: "No cache available and currently outside allowed business hours." }));
-      return null;
+      return { error: 'No hay datos en caché y la consulta debe hacerse de L a V después de las 11:45 am', statusCode: 400 };
     }
   }
 
   const cachedData = getCache();
   if (cachedData) {
     log('⚡ Retornando IBR desde el caché (válido por 1 hr).');
-    if (isJsonOutput) console.log(JSON.stringify(cachedData));
-    else console.log(JSON.stringify(cachedData, null, 2));
     return cachedData;
   }
 
   log('⏳ Consultando IBR desde BanRep...\n');
 
-  const { data } = await axios.get(
-    'https://totoro.banrep.gov.co/estadisticas-economicas/',
-    {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml',
-      },
-      timeout: 20000,
-    }
-  );
+  let data;
+  try {
+    const response = await axios.get(
+      'https://totoro.banrep.gov.co/estadisticas-economicas/',
+      {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml',
+        },
+        timeout: 20000,
+      }
+    );
+    data = response.data;
+  } catch (error) {
+    return { error: 'El servicio del Banco de la República está caído o tardó demasiado en responder.', statusCode: 502, details: error.message };
+  }
 
   const $ = cheerio.load(data);
 
@@ -141,7 +143,9 @@ async function obtenerIBR() {
     }
   }
 
-  if (!ibr) throw new Error('No se pudo extraer el IBR');
+  if (!ibr) {
+    return { error: 'La estructura de la web del Banco de la República ha cambiado. Actualización de scraper requerida.', statusCode: 500 };
+  }
 
   const fecha = new Date().toLocaleDateString('es-CO');
   const ibrEA = (Math.pow(1 + (ibr / 100) / 365, 365) - 1) * 100;
@@ -171,17 +175,54 @@ async function obtenerIBR() {
   saveCache(resultado);
   log('\n📦 Se guardó el resultado en caché.');
 
-  if (isJsonOutput) {
-    console.log(JSON.stringify(resultado));
-  }
-
   return resultado;
 }
 
-obtenerIBR().catch(e => {
-  if (isJsonOutput) {
-    console.log(JSON.stringify({ error: e.message }));
-  } else {
-    console.error('❌', e.message);
+// Handler para AWS Lambda
+exports.handler = async (event, context) => {
+  try {
+    const result = await obtenerIBR();
+
+    if (result.error) {
+      return {
+        statusCode: result.statusCode || 500,
+        body: JSON.stringify({ error: result.error, details: result.details })
+      };
+    }
+
+    return {
+      statusCode: 200,
+      body: JSON.stringify(result)
+    };
+  } catch (err) {
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: 'Error interno en Lambda', details: err.message })
+    };
   }
-});
+};
+
+// Ejecución por consola (Local / NPM CLI)
+if (require.main === module) {
+  obtenerIBR().then(res => {
+    if (isJsonOutput) {
+      // Elimina la propiedad extra de statusCode si fue retornada internamente para no ensuciar la salida JSON normal
+      if (res && res.statusCode) delete res.statusCode;
+      console.log(JSON.stringify(res, null, 2));
+    } else if (res && res.error) {
+      console.error('❌', res.error, res.details || '');
+    }
+  }).catch(e => {
+    if (isJsonOutput) {
+      console.log(JSON.stringify({ error: e.message }));
+    } else {
+      console.error('❌', e.message);
+    }
+  });
+}
+
+// Exportar funciones útiles para los tests sin modificar el resto
+exports.obtenerIBR = obtenerIBR;
+exports.isBusinessDayAndTime = isBusinessDayAndTime;
+exports.getCache = getCache;
+exports.saveCache = saveCache;
