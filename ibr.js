@@ -205,18 +205,36 @@ exports.handler = async (event, context) => {
 // Ejecución por consola (Local / NPM CLI)
 if (require.main === module) {
   obtenerIBR().then(res => {
+    // Si res no existe, es que hubo un error que ya fue manejado o estamos fuera de horario sin caché
+    if (!res) return;
+
+    // Elimina la propiedad extra de statusCode si fue retornada internamente para no ensuciar la salida JSON normal
+    if (res.statusCode) delete res.statusCode;
+
+    if (res.error) {
+      if (isJsonOutput) {
+        console.log(JSON.stringify(res));
+      } else {
+        console.error('\n❌ Error:', res.error);
+        if (res.details) console.error('Detalles:', res.details);
+      }
+      return;
+    }
+
+    // Tanto en modo API como en modo Start normal, queremos imprimir el JSON resultante al final
     if (isJsonOutput) {
-      // Elimina la propiedad extra de statusCode si fue retornada internamente para no ensuciar la salida JSON normal
-      if (res && res.statusCode) delete res.statusCode;
+      // Salida pura para la API
+      console.log(JSON.stringify(res));
+    } else {
+      // Salida embellecida para la consola humana
+      console.log('\n📦 Objeto JSON Resultante:');
       console.log(JSON.stringify(res, null, 2));
-    } else if (res && res.error) {
-      console.error('❌', res.error, res.details || '');
     }
   }).catch(e => {
     if (isJsonOutput) {
       console.log(JSON.stringify({ error: e.message }));
     } else {
-      console.error('❌', e.message);
+      console.error('\n❌ Excepción inesperada:', e.message);
     }
   });
 }
